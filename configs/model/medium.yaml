@@ -8,3 +8,5 @@ n_heads: 16
 scale_by_sigma: True
 dropout: 0.1
 tie_word_embeddings: False
+low_rank_attn: False
+low_rank_percentage: 1.0

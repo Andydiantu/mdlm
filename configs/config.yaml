@@ -78,6 +78,7 @@ trainer:
 wandb:
   project: text-diffusion
   notes: Mulan for text
+  mode: online  # online / offline
   group: null
   job_type: null
   name: null

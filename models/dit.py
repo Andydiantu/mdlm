@@ -10,6 +10,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
 
+from models.low_rank import LowRankLinear
+
 # Flags required to enable jit fusion kernels
 torch._C._jit_set_profiling_mode(False)
 torch._C._jit_set_profiling_executor(False)
@@ -212,20 +214,40 @@ class LabelEmbedder(nn.Module):
 
 
 class DDiTBlock(nn.Module):
-  def __init__(self, dim, n_heads, cond_dim, mlp_ratio=4, dropout=0.1):
+  def __init__(self, dim, n_heads, cond_dim, mlp_ratio=4, dropout=0.1,
+               low_rank_attn=False, low_rank_percentage=1.0):
     super().__init__()
     self.n_heads = n_heads
 
     self.norm1 = LayerNorm(dim)
-    self.attn_qkv = nn.Linear(dim, 3 * dim, bias=False)
-    self.attn_out = nn.Linear(dim, dim, bias=False)
+    if low_rank_attn:
+      self.attn_qkv = LowRankLinear(
+          dim, 3 * dim,
+          rank_percentage=low_rank_percentage, bias=False)
+      self.attn_out = LowRankLinear(
+          dim, dim,
+          rank_percentage=low_rank_percentage, bias=False)
+    else:
+      self.attn_qkv = nn.Linear(dim, 3 * dim, bias=False)
+      self.attn_out = nn.Linear(dim, dim, bias=False)
     self.dropout1 = nn.Dropout(dropout)
 
     self.norm2 = LayerNorm(dim)
-    self.mlp = nn.Sequential(
-      nn.Linear(dim, mlp_ratio * dim, bias=True),
-      nn.GELU(approximate='tanh'),
-      nn.Linear(mlp_ratio * dim, dim, bias=True))
+    if low_rank_attn:
+      self.mlp = nn.Sequential(
+        LowRankLinear(
+          dim, mlp_ratio * dim,
+          rank_percentage=low_rank_percentage, bias=True),
+        nn.GELU(approximate='tanh'),
+        LowRankLinear(
+          mlp_ratio * dim, dim,
+          rank_percentage=low_rank_percentage, bias=True)
+      )
+    else:
+      self.mlp = nn.Sequential(
+        nn.Linear(dim, mlp_ratio * dim, bias=True),
+        nn.GELU(approximate='tanh'),
+        nn.Linear(mlp_ratio * dim, dim, bias=True))
     self.dropout2 = nn.Dropout(dropout)
     self.dropout = dropout
 
@@ -336,12 +358,19 @@ class DIT(nn.Module, huggingface_hub.PyTorchModelHubMixin):
     self.rotary_emb = Rotary(
       config.model.hidden_size // config.model.n_heads)
 
+    low_rank_attn = getattr(
+        config.model, 'low_rank_attn', False)
+    low_rank_percentage = getattr(
+        config.model, 'low_rank_percentage', 1.0)
+
     blocks = []
     for _ in range(config.model.n_blocks):
       blocks.append(DDiTBlock(config.model.hidden_size,
                               config.model.n_heads,
                               config.model.cond_dim,
-                              dropout=config.model.dropout))
+                              dropout=config.model.dropout,
+                              low_rank_attn=low_rank_attn,
+                              low_rank_percentage=low_rank_percentage))
     self.blocks = nn.ModuleList(blocks)
 
     self.output_layer = DDitFinalLayer(
