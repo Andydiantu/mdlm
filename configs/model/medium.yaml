@@ -10,3 +10,7 @@ dropout: 0.1
 tie_word_embeddings: False
 low_rank_attn: False
 low_rank_percentage: 1.0
+timestep_low_rank: False
+timestep_low_rank_r_min_ratio: 0.4
+timestep_low_rank_logistic_k: 8.0
+timestep_low_rank_logistic_m: 0.6

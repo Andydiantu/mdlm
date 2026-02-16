@@ -23,4 +23,5 @@ python -u -m main \
   sampling.steps=1000 \
   model.low_rank_attn=True \
   model.low_rank_percentage=0.5 \
-  wandb.name=mdlm-lm1b
+  model.timestep_low_rank=False \
+  wandb.name=mdlm-lm1b-SLR

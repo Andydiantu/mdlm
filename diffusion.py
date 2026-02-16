@@ -311,9 +311,19 @@ class Diffusion(L.LightningModule):
 
   def forward(self, x, sigma):
     """Returns log score."""
+    # Keep the real sigma for timestep-dependent rank gating
+    raw_sigma = sigma
+    if raw_sigma is not None and raw_sigma.ndim > 1:
+      raw_sigma = raw_sigma.squeeze(-1)
     sigma = self._process_sigma(sigma)
     with torch.cuda.amp.autocast(dtype=torch.float32):
-      logits = self.backbone(x, sigma)
+      if (self.config.backbone == 'dit'
+          and getattr(self.config.model,
+                      'timestep_low_rank', False)):
+        logits = self.backbone(x, sigma,
+                               sigma_for_rank=raw_sigma)
+      else:
+        logits = self.backbone(x, sigma)
     
     if self.parameterization == 'subs':
       return self._subs_parameterization(logits=logits,

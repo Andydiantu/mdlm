@@ -262,6 +262,22 @@ class DDiTBlock(nn.Module):
     else:
       return bias_dropout_add_scale_fused_inference
 
+  def _inject_sigma(self, sigma, sigma_max, r_min_ratio,
+                    logistic_k, logistic_m):
+    """Set timestep-dependent rank gating on all LowRankLinear children."""
+    for module in self.modules():
+      if isinstance(module, LowRankLinear):
+        module._sigma = sigma
+        module._sigma_max = sigma_max
+        module._r_min_ratio = r_min_ratio
+        module._logistic_k = logistic_k
+        module._logistic_m = logistic_m
+
+  def _clear_sigma(self):
+    """Remove timestep conditioning from all LowRankLinear children."""
+    for module in self.modules():
+      if isinstance(module, LowRankLinear):
+        module._sigma = None
 
   def forward(self, x, rotary_cos_sin, c, seqlens=None):
     batch_size, seq_len = x.shape[0], x.shape[1]
@@ -363,6 +379,19 @@ class DIT(nn.Module, huggingface_hub.PyTorchModelHubMixin):
     low_rank_percentage = getattr(
         config.model, 'low_rank_percentage', 1.0)
 
+    # Timestep-dependent low-rank config
+    self.timestep_low_rank = getattr(
+        config.model, 'timestep_low_rank', False)
+    self._ts_r_min_ratio = getattr(
+        config.model, 'timestep_low_rank_r_min_ratio', 0.4)
+    self._ts_logistic_k = getattr(
+        config.model, 'timestep_low_rank_logistic_k', 8.0)
+    self._ts_logistic_m = getattr(
+        config.model, 'timestep_low_rank_logistic_m', 0.6)
+    # sigma_max is read from noise config; fall back to 20.0
+    self._sigma_max = getattr(
+        getattr(config, 'noise', None), 'sigma_max', 20.0)
+
     blocks = []
     for _ in range(config.model.n_blocks):
       blocks.append(DDiTBlock(config.model.hidden_size,
@@ -385,15 +414,28 @@ class DIT(nn.Module, huggingface_hub.PyTorchModelHubMixin):
     else:
       return  bias_dropout_add_scale_fused_inference
 
-  def forward(self, indices, sigma):
+  def forward(self, indices, sigma, sigma_for_rank=None):
     x = self.vocab_embed(indices)
     c = F.silu(self.sigma_map(sigma))
 
     rotary_cos_sin = self.rotary_emb(x)
 
+    # Inject timestep-dependent rank gating if enabled
+    if self.timestep_low_rank and sigma_for_rank is not None:
+      for block in self.blocks:
+        block._inject_sigma(
+            sigma_for_rank, self._sigma_max,
+            self._ts_r_min_ratio,
+            self._ts_logistic_k, self._ts_logistic_m)
+
     with torch.cuda.amp.autocast(dtype=torch.bfloat16):
       for i in range(len(self.blocks)):
         x = self.blocks[i](x, rotary_cos_sin, c, seqlens=None)
       x = self.output_layer(x, c)
+
+    # Clean up sigma references to avoid holding onto tensors
+    if self.timestep_low_rank and sigma_for_rank is not None:
+      for block in self.blocks:
+        block._clear_sigma()
 
     return x
