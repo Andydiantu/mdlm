@@ -43,6 +43,8 @@ training:
   importance_sampling: False
   sampling_eps: 1e-3
   change_of_variables: False
+  flops_lambda: 0.0
+  target_activation_ratio: 0.5
 
 eval:
   checkpoint_path: ''  # Used to evaluate a checkpoint after training.

@@ -17,6 +17,7 @@ import dataloader
 import models
 import noise_schedule
 import utils
+from models.low_rank import LowRankLinear
 
 LOG2 = math.log(2)
 
@@ -150,6 +151,13 @@ class Diffusion(L.LightningModule):
     self.neg_infinity = -1000000.0
     self.fast_forward_epochs = None
     self.fast_forward_batches = None
+
+    # Learnable rank schedule config
+    self.flops_lambda = getattr(
+        self.config.training, 'flops_lambda', 0.0)
+    self.target_activation_ratio = getattr(
+        self.config.training, 'target_activation_ratio', 0.5)
+
     self._validate_configuration()
 
   def _validate_configuration(self):
@@ -309,19 +317,19 @@ class Diffusion(L.LightningModule):
     assert sigma.ndim == 1, sigma.shape
     return sigma
 
-  def forward(self, x, sigma):
+  def forward(self, x, sigma, t_for_rank=None):
     """Returns log score."""
-    # Keep the real sigma for timestep-dependent rank gating
-    raw_sigma = sigma
-    if raw_sigma is not None and raw_sigma.ndim > 1:
-      raw_sigma = raw_sigma.squeeze(-1)
     sigma = self._process_sigma(sigma)
     with torch.cuda.amp.autocast(dtype=torch.float32):
-      if (self.config.backbone == 'dit'
-          and getattr(self.config.model,
-                      'timestep_low_rank', False)):
+      _lr_mode = getattr(self.config.model,
+                         'low_rank_mode', 'none')
+      _needs_timestep = (
+          _lr_mode in ('dynamic', 'learnable')
+          or getattr(self.config.model,
+                     'timestep_low_rank', False))
+      if (self.config.backbone == 'dit' and _needs_timestep):
         logits = self.backbone(x, sigma,
-                               sigma_for_rank=raw_sigma)
+                               t_for_rank=t_for_rank)
       else:
         logits = self.backbone(x, sigma)
     
@@ -399,12 +407,59 @@ class Diffusion(L.LightningModule):
 
   def training_step(self, batch, batch_idx):
     loss = self._compute_loss(batch, prefix='train')
+
+    # ---- learnable rank schedule: FLOP loss + logging ----
+    flops_loss = self._compute_flops_loss()
+    if self.flops_lambda > 0 and flops_loss.item() > 0:
+      loss = loss + self.flops_lambda * flops_loss
+
     self.log(name='trainer/loss',
              value=loss.item(),
              on_step=True,
              on_epoch=False,
              sync_dist=True)
+    self.log(name='trainer/flops_loss',
+             value=flops_loss.item(),
+             on_step=True,
+             on_epoch=False,
+             sync_dist=True)
+    self._log_rank_schedule()
     return loss
+
+  def _compute_flops_loss(self):
+    """Squared error between expected and target activation ratio."""
+    ratios = []
+    for module in self.backbone.modules():
+      if isinstance(module, LowRankLinear) and module.schedule is not None:
+        expected = module.schedule.expected_rank(
+            sampling_eps=self.sampling_eps)
+        ratios.append(expected / module.rank)
+    if not ratios:
+      return torch.tensor(0.0, device=self.device)
+    mean_ratio = torch.stack(ratios).mean()
+    return (mean_ratio - self.target_activation_ratio) ** 2
+
+  def _log_rank_schedule(self):
+    """Log learnable rank schedule parameters to wandb."""
+    layer_idx = 0
+    for module in self.backbone.modules():
+      if isinstance(module, LowRankLinear) and module.schedule is not None:
+        prefix = f'rank_schedule/layer_{layer_idx}'
+        self.log(f'{prefix}/alpha',
+                 module.schedule.alpha.item(),
+                 on_step=True, on_epoch=False, sync_dist=True)
+        self.log(f'{prefix}/rho_min',
+                 module.schedule.rho_min.item(),
+                 on_step=True, on_epoch=False, sync_dist=True)
+        expected = module.schedule.expected_rank(
+            sampling_eps=self.sampling_eps)
+        self.log(f'{prefix}/expected_rank',
+                 expected.item(),
+                 on_step=True, on_epoch=False, sync_dist=True)
+        self.log(f'{prefix}/expected_ratio',
+                 (expected / module.rank).item(),
+                 on_step=True, on_epoch=False, sync_dist=True)
+        layer_idx += 1
 
   def on_validation_epoch_start(self):
     if self.ema:
@@ -874,7 +929,8 @@ class Diffusion(L.LightningModule):
       move_chance = 1 - torch.exp(-sigma[:, None])
 
     xt = self.q_xt(x0, move_chance)
-    model_output = self.forward(xt, unet_conditioning)
+    model_output = self.forward(xt, unet_conditioning,
+                                t_for_rank=t)
     utils.print_nans(model_output, 'model_output')
 
     if self.parameterization == 'sedd':
@@ -902,7 +958,7 @@ class Diffusion(L.LightningModule):
     
     return - log_p_theta * (
       dsigma / torch.expm1(sigma))[:, None]
-
+      
   def _loss(self, x0, attention_mask):
     (input_tokens, output_tokens,
      attention_mask) = self._maybe_sub_sample(

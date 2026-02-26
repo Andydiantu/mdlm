@@ -14,3 +14,5 @@ timestep_low_rank: False
 timestep_low_rank_r_min_ratio: 0.4
 timestep_low_rank_logistic_k: 8.0
 timestep_low_rank_logistic_m: 0.6
+timestep_low_rank_init_mode: "match_high_rank"
+low_rank_mode: "none"

@@ -215,18 +215,24 @@ class LabelEmbedder(nn.Module):
 
 class DDiTBlock(nn.Module):
   def __init__(self, dim, n_heads, cond_dim, mlp_ratio=4, dropout=0.1,
-               low_rank_attn=False, low_rank_percentage=1.0):
+               low_rank_attn=False, low_rank_percentage=1.0,
+               low_rank_mode='none'):
     super().__init__()
     self.n_heads = n_heads
+    self.low_rank_mode = low_rank_mode
 
     self.norm1 = LayerNorm(dim)
     if low_rank_attn:
+      _lr_mode = low_rank_mode if low_rank_mode in (
+          'static', 'dynamic', 'learnable') else 'static'
       self.attn_qkv = LowRankLinear(
           dim, 3 * dim,
-          rank_percentage=low_rank_percentage, bias=False)
+          rank_percentage=low_rank_percentage, bias=False,
+          mode=_lr_mode)
       self.attn_out = LowRankLinear(
           dim, dim,
-          rank_percentage=low_rank_percentage, bias=False)
+          rank_percentage=low_rank_percentage, bias=False,
+          mode=_lr_mode)
     else:
       self.attn_qkv = nn.Linear(dim, 3 * dim, bias=False)
       self.attn_out = nn.Linear(dim, dim, bias=False)
@@ -237,11 +243,13 @@ class DDiTBlock(nn.Module):
       self.mlp = nn.Sequential(
         LowRankLinear(
           dim, mlp_ratio * dim,
-          rank_percentage=low_rank_percentage, bias=True),
+          rank_percentage=low_rank_percentage, bias=True,
+          mode=_lr_mode),
         nn.GELU(approximate='tanh'),
         LowRankLinear(
           mlp_ratio * dim, dim,
-          rank_percentage=low_rank_percentage, bias=True)
+          rank_percentage=low_rank_percentage, bias=True,
+          mode=_lr_mode)
       )
     else:
       self.mlp = nn.Sequential(
@@ -262,22 +270,23 @@ class DDiTBlock(nn.Module):
     else:
       return bias_dropout_add_scale_fused_inference
 
-  def _inject_sigma(self, sigma, sigma_max, r_min_ratio,
-                    logistic_k, logistic_m):
+  def _inject_timestep(self, timestep, r_min_ratio,
+                       logistic_k, logistic_m,
+                       reverse_schedule=False):
     """Set timestep-dependent rank gating on all LowRankLinear children."""
     for module in self.modules():
       if isinstance(module, LowRankLinear):
-        module._sigma = sigma
-        module._sigma_max = sigma_max
+        module._timestep = timestep
         module._r_min_ratio = r_min_ratio
         module._logistic_k = logistic_k
         module._logistic_m = logistic_m
+        module._reverse_schedule = reverse_schedule
 
-  def _clear_sigma(self):
+  def _clear_timestep(self):
     """Remove timestep conditioning from all LowRankLinear children."""
     for module in self.modules():
       if isinstance(module, LowRankLinear):
-        module._sigma = None
+        module._timestep = None
 
   def forward(self, x, rotary_cos_sin, c, seqlens=None):
     batch_size, seq_len = x.shape[0], x.shape[1]
@@ -379,18 +388,47 @@ class DIT(nn.Module, huggingface_hub.PyTorchModelHubMixin):
     low_rank_percentage = getattr(
         config.model, 'low_rank_percentage', 1.0)
 
-    # Timestep-dependent low-rank config
+    # Unified low-rank mode: 'none', 'static', 'dynamic', 'learnable'
+    self.low_rank_mode = getattr(
+        config.model, 'low_rank_mode', 'none')
+
+    # Backward compatibility: infer mode from old flags
     self.timestep_low_rank = getattr(
         config.model, 'timestep_low_rank', False)
+    if self.low_rank_mode == 'none':
+      if self.timestep_low_rank and low_rank_attn:
+        self.low_rank_mode = 'dynamic'
+      elif low_rank_attn:
+        self.low_rank_mode = 'static'
+    # For dynamic/learnable modes, ensure timestep injection
+    if self.low_rank_mode in ('dynamic', 'learnable'):
+      self.timestep_low_rank = True
+
     self._ts_r_min_ratio = getattr(
         config.model, 'timestep_low_rank_r_min_ratio', 0.4)
     self._ts_logistic_k = getattr(
         config.model, 'timestep_low_rank_logistic_k', 8.0)
     self._ts_logistic_m = getattr(
         config.model, 'timestep_low_rank_logistic_m', 0.6)
-    # sigma_max is read from noise config; fall back to 20.0
-    self._sigma_max = getattr(
-        getattr(config, 'noise', None), 'sigma_max', 20.0)
+    self._ts_init_mode = getattr(
+        config.model, 'timestep_low_rank_init_mode', 'match_high_rank')
+    self._ts_reverse_schedule = getattr(
+        config.model, 'timestep_low_rank_reverse_schedule', False)
+
+    # Adjust rank_percentage based on init mode
+    adjusted_low_rank_percentage = low_rank_percentage
+    if self.timestep_low_rank and low_rank_attn:
+      sampling_eps = getattr(config.training, 'sampling_eps', 1e-3)
+      adjusted_low_rank_percentage = LowRankLinear.compute_adjusted_rank_percentage(
+          in_features=config.model.hidden_size,
+          out_features=config.model.hidden_size,
+          rank_percentage=low_rank_percentage,
+          r_min_ratio=self._ts_r_min_ratio,
+          logistic_k=self._ts_logistic_k,
+          logistic_m=self._ts_logistic_m,
+          sampling_eps=sampling_eps,
+          mode=self._ts_init_mode,
+          reverse_schedule=self._ts_reverse_schedule)
 
     blocks = []
     for _ in range(config.model.n_blocks):
@@ -399,7 +437,8 @@ class DIT(nn.Module, huggingface_hub.PyTorchModelHubMixin):
                               config.model.cond_dim,
                               dropout=config.model.dropout,
                               low_rank_attn=low_rank_attn,
-                              low_rank_percentage=low_rank_percentage))
+                              low_rank_percentage=adjusted_low_rank_percentage,
+                              low_rank_mode=self.low_rank_mode))
     self.blocks = nn.ModuleList(blocks)
 
     self.output_layer = DDitFinalLayer(
@@ -408,34 +447,74 @@ class DIT(nn.Module, huggingface_hub.PyTorchModelHubMixin):
       config.model.cond_dim)
     self.scale_by_sigma = config.model.scale_by_sigma
 
+    # Print expected rank statistics if timestep-dependent low-rank is enabled
+    if self.timestep_low_rank and low_rank_attn:
+      # Create representative layers with both original and adjusted percentages
+      sampling_eps = getattr(config.training, 'sampling_eps', 1e-3)
+      
+      # Static low-rank layer (for reference)
+      static_layer = LowRankLinear(
+          config.model.hidden_size,
+          config.model.hidden_size,
+          rank_percentage=low_rank_percentage)
+      
+      # Actual timestep-dependent layer
+      temp_layer = LowRankLinear(
+          config.model.hidden_size,
+          config.model.hidden_size,
+          rank_percentage=adjusted_low_rank_percentage)
+      temp_layer._r_min_ratio = self._ts_r_min_ratio
+      temp_layer._logistic_k = self._ts_logistic_k
+      temp_layer._logistic_m = self._ts_logistic_m
+      temp_layer._reverse_schedule = self._ts_reverse_schedule
+      
+      expected_rank, expected_pct = temp_layer.calculate_expected_rank(
+          sampling_eps=sampling_eps)
+      
+      print("\n" + "="*60)
+      print("Timestep-Dependent Low-Rank Configuration")
+      print("="*60)
+      print(f"Initialization mode: {self._ts_init_mode}")
+      print(f"Static low-rank reference: rank={static_layer.rank}")
+      print(f"Timestep-dependent full rank: {temp_layer.rank}")
+      print(f"Min rank (r_min_ratio={self._ts_r_min_ratio}): "
+            f"{max(1, int(round(self._ts_r_min_ratio * temp_layer.rank)))}")
+      print(f"Logistic schedule: k={self._ts_logistic_k}, m={self._ts_logistic_m}")
+      print(f"Reverse schedule: {self._ts_reverse_schedule}")
+      print(f"Expected rank activated: {expected_rank:.2f} ({expected_pct:.1f}%)")
+      if self._ts_init_mode == 'match_expected_rank':
+        print(f"  → Matches static low-rank: {static_layer.rank}")
+      print("="*60 + "\n")
+
   def _get_bias_dropout_scale(self):
     if self.training:
       return bias_dropout_add_scale_fused_train
     else:
       return  bias_dropout_add_scale_fused_inference
 
-  def forward(self, indices, sigma, sigma_for_rank=None):
+  def forward(self, indices, sigma, t_for_rank=None):
     x = self.vocab_embed(indices)
     c = F.silu(self.sigma_map(sigma))
 
     rotary_cos_sin = self.rotary_emb(x)
 
     # Inject timestep-dependent rank gating if enabled
-    if self.timestep_low_rank and sigma_for_rank is not None:
+    if self.timestep_low_rank and t_for_rank is not None:
       for block in self.blocks:
-        block._inject_sigma(
-            sigma_for_rank, self._sigma_max,
+        block._inject_timestep(
+            t_for_rank,
             self._ts_r_min_ratio,
-            self._ts_logistic_k, self._ts_logistic_m)
+            self._ts_logistic_k, self._ts_logistic_m,
+            self._ts_reverse_schedule)
 
     with torch.cuda.amp.autocast(dtype=torch.bfloat16):
       for i in range(len(self.blocks)):
         x = self.blocks[i](x, rotary_cos_sin, c, seqlens=None)
       x = self.output_layer(x, c)
 
-    # Clean up sigma references to avoid holding onto tensors
-    if self.timestep_low_rank and sigma_for_rank is not None:
+    # Clean up timestep references to avoid holding onto tensors
+    if self.timestep_low_rank and t_for_rank is not None:
       for block in self.blocks:
-        block._clear_sigma()
+        block._clear_timestep()
 
     return x
