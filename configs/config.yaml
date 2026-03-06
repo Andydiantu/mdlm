@@ -45,6 +45,7 @@ training:
   change_of_variables: False
   flops_lambda: 0.0
   target_activation_ratio: 0.5
+  frozen_schedule_ckpt: null  # Path to checkpoint for frozen_schedule mode
 
 eval:
   checkpoint_path: ''  # Used to evaluate a checkpoint after training.

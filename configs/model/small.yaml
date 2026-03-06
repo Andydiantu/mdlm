@@ -16,3 +16,7 @@ timestep_low_rank_logistic_k: 8.0
 timestep_low_rank_logistic_m: 0.6
 timestep_low_rank_init_mode: "match_high_rank"
 low_rank_mode: "none"
+learnable_gate_mode: "soft"
+learnable_gate_threshold: 0.5
+learnable_min_active_rank: 1
+learnable_eval_slice: true

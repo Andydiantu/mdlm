@@ -13,21 +13,16 @@ conda activate mdlm
 /usr/bin/nvidia-smi
 uptime
 
+export WANDB_INIT_TIMEOUT=300
+
+
 python -u -m main \
-  loader.batch_size=512 \
-  loader.eval_batch_size=512 \
-  model=tiny \
-  data=lm1b \
+  loader.batch_size=8 \
+  loader.eval_batch_size=8 \
+  model=small \
+  data=openwebtext-split \
+  wandb.name=mdlm-owt-356 \
   parameterization=subs \
-  time_conditioning=True \
+  model.length=1024 \
   eval.compute_generative_perplexity=True \
-  trainer.val_check_interval=1 \
-  model.length=128 \
-  sampling.steps=1000 \
-  model.low_rank_attn=True \
-  model.low_rank_percentage=0.5 \
-  model.timestep_low_rank=True \
-  model.timestep_low_rank_init_mode="match_expected_rank" \
-  model.timestep_low_rank_r_min_ratio=0.5 \
-  wandb.name=mdlm-lm1b-Fix-NALR-match-expected-rank-reverse-timestep-condition \
-  +model.timestep_low_rank_reverse_schedule=True
+  sampling.steps=1000

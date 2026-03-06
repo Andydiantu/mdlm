@@ -17,7 +17,8 @@ import dataloader
 import models
 import noise_schedule
 import utils
-from models.low_rank import LowRankLinear
+from models.low_rank import LowRankLinear, LearnableRankSchedule
+from models.frozen_schedule import build_verified_schedule_state
 
 LOG2 = math.log(2)
 
@@ -110,6 +111,41 @@ class Diffusion(L.LightningModule):
       raise ValueError(
         f'Unknown backbone: {self.config.backbone}')
 
+    # --- Frozen schedule: load rank-schedule params & freeze ---
+    _lr_mode = getattr(config.model, 'low_rank_mode', 'none')
+    if _lr_mode == 'frozen_schedule':
+      frozen_ckpt_path = getattr(
+          config.training, 'frozen_schedule_ckpt', None)
+      assert frozen_ckpt_path is not None, \
+          "frozen_schedule mode requires training.frozen_schedule_ckpt"
+      ckpt = torch.load(frozen_ckpt_path, map_location='cpu')
+      src_state = ckpt.get('state_dict', ckpt)
+      schedule_state = build_verified_schedule_state(
+          source_state=src_state,
+          target_state=self.backbone.state_dict(),
+          ckpt_path=frozen_ckpt_path)
+      self.backbone.load_state_dict(schedule_state, strict=False)
+      print(f"[frozen_schedule] Loaded {len(schedule_state)} "
+            f"schedule params from {frozen_ckpt_path}")
+      # Freeze all LearnableRankSchedule parameters
+      for module in self.backbone.modules():
+        if isinstance(module, LearnableRankSchedule):
+          for param in module.parameters():
+            param.requires_grad_(False)
+      # Log loaded values
+      for i, module in enumerate(
+          m for m in self.backbone.modules()
+          if isinstance(m, LowRankLinear) and m.schedule is not None):
+        print(f"[frozen_schedule] Layer {i}: "
+              f"alpha={module.schedule.alpha.item():.4f}, "
+              f"rho_min={module.schedule.rho_min.item():.4f}, "
+              f"expected_rank="
+              f"{module.schedule.expected_rank().item():.2f}/"
+              f"{module.rank}")
+      # Disable FLOPs loss since schedule is fixed
+      self.config.training.flops_lambda = 0.0
+      print("[frozen_schedule] FLOPs loss disabled (schedule is frozen)")
+
     self.T = self.config.T
     self.subs_masking = self.config.subs_masking
 
@@ -157,6 +193,47 @@ class Diffusion(L.LightningModule):
         self.config.training, 'flops_lambda', 0.0)
     self.target_activation_ratio = getattr(
         self.config.training, 'target_activation_ratio', 0.5)
+
+    # --- Frozen schedule: load rank-schedule params & freeze ---
+    _lr_mode = getattr(self.config.model, 'low_rank_mode', 'none')
+    if _lr_mode == 'frozen_schedule':
+      frozen_ckpt_path = getattr(
+          self.config.training, 'frozen_schedule_ckpt', None)
+      assert frozen_ckpt_path is not None, \
+          ("frozen_schedule mode requires "
+           "training.frozen_schedule_ckpt to be set")
+      ckpt = torch.load(frozen_ckpt_path, map_location='cpu')
+      # Lightning checkpoints store state_dict under 'state_dict'
+      src_state = ckpt.get('state_dict', ckpt)
+      schedule_state = build_verified_schedule_state(
+          source_state=src_state,
+          target_state=self.backbone.state_dict(),
+          ckpt_path=frozen_ckpt_path,
+      )
+      self.backbone.load_state_dict(schedule_state, strict=False)
+      print(f"[frozen_schedule] Loaded {len(schedule_state)} "
+            f"schedule params from {frozen_ckpt_path}")
+      # Freeze all LearnableRankSchedule parameters
+      for module in self.backbone.modules():
+        if isinstance(module, LearnableRankSchedule):
+          for param in module.parameters():
+            param.requires_grad_(False)
+      # Log loaded schedule values
+      for i, module in enumerate(
+          m for m in self.backbone.modules()
+          if isinstance(m, LowRankLinear)
+          and m.schedule is not None):
+        print(
+            f"[frozen_schedule] Layer {i}: "
+            f"alpha={module.schedule.alpha.item():.4f}, "
+            f"rho_min={module.schedule.rho_min.item():.4f}, "
+            f"expected_rank="
+            f"{module.schedule.expected_rank().item():.2f}/"
+            f"{module.rank}")
+      # Disable FLOPs loss since schedule is fixed
+      self.flops_lambda = 0.0
+      print("[frozen_schedule] FLOPs loss disabled "
+            "(schedule is frozen)")
 
     self._validate_configuration()
 
@@ -324,7 +401,7 @@ class Diffusion(L.LightningModule):
       _lr_mode = getattr(self.config.model,
                          'low_rank_mode', 'none')
       _needs_timestep = (
-          _lr_mode in ('dynamic', 'learnable')
+          _lr_mode in ('dynamic', 'learnable', 'frozen_schedule')
           or getattr(self.config.model,
                      'timestep_low_rank', False))
       if (self.config.backbone == 'dit' and _needs_timestep):

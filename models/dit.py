@@ -216,7 +216,11 @@ class LabelEmbedder(nn.Module):
 class DDiTBlock(nn.Module):
   def __init__(self, dim, n_heads, cond_dim, mlp_ratio=4, dropout=0.1,
                low_rank_attn=False, low_rank_percentage=1.0,
-               low_rank_mode='none'):
+               low_rank_mode='none',
+               learnable_gate_mode='soft',
+               learnable_gate_threshold=0.5,
+               learnable_min_active_rank=1,
+               learnable_eval_slice=True):
     super().__init__()
     self.n_heads = n_heads
     self.low_rank_mode = low_rank_mode
@@ -224,15 +228,23 @@ class DDiTBlock(nn.Module):
     self.norm1 = LayerNorm(dim)
     if low_rank_attn:
       _lr_mode = low_rank_mode if low_rank_mode in (
-          'static', 'dynamic', 'learnable') else 'static'
+          'static', 'dynamic', 'learnable', 'frozen_schedule') else 'static'
       self.attn_qkv = LowRankLinear(
           dim, 3 * dim,
           rank_percentage=low_rank_percentage, bias=False,
-          mode=_lr_mode)
+          mode=_lr_mode,
+          learnable_gate_mode=learnable_gate_mode,
+          learnable_gate_threshold=learnable_gate_threshold,
+          learnable_min_active_rank=learnable_min_active_rank,
+          learnable_eval_slice=learnable_eval_slice)
       self.attn_out = LowRankLinear(
           dim, dim,
           rank_percentage=low_rank_percentage, bias=False,
-          mode=_lr_mode)
+          mode=_lr_mode,
+          learnable_gate_mode=learnable_gate_mode,
+          learnable_gate_threshold=learnable_gate_threshold,
+          learnable_min_active_rank=learnable_min_active_rank,
+          learnable_eval_slice=learnable_eval_slice)
     else:
       self.attn_qkv = nn.Linear(dim, 3 * dim, bias=False)
       self.attn_out = nn.Linear(dim, dim, bias=False)
@@ -244,12 +256,20 @@ class DDiTBlock(nn.Module):
         LowRankLinear(
           dim, mlp_ratio * dim,
           rank_percentage=low_rank_percentage, bias=True,
-          mode=_lr_mode),
+          mode=_lr_mode,
+          learnable_gate_mode=learnable_gate_mode,
+          learnable_gate_threshold=learnable_gate_threshold,
+          learnable_min_active_rank=learnable_min_active_rank,
+          learnable_eval_slice=learnable_eval_slice),
         nn.GELU(approximate='tanh'),
         LowRankLinear(
           mlp_ratio * dim, dim,
           rank_percentage=low_rank_percentage, bias=True,
-          mode=_lr_mode)
+          mode=_lr_mode,
+          learnable_gate_mode=learnable_gate_mode,
+          learnable_gate_threshold=learnable_gate_threshold,
+          learnable_min_active_rank=learnable_min_active_rank,
+          learnable_eval_slice=learnable_eval_slice)
       )
     else:
       self.mlp = nn.Sequential(
@@ -388,6 +408,16 @@ class DIT(nn.Module, huggingface_hub.PyTorchModelHubMixin):
     low_rank_percentage = getattr(
         config.model, 'low_rank_percentage', 1.0)
 
+    # Learnable gate mode config
+    learnable_gate_mode = getattr(
+        config.model, 'learnable_gate_mode', 'soft')
+    learnable_gate_threshold = getattr(
+        config.model, 'learnable_gate_threshold', 0.5)
+    learnable_min_active_rank = getattr(
+        config.model, 'learnable_min_active_rank', 1)
+    learnable_eval_slice = getattr(
+        config.model, 'learnable_eval_slice', True)
+
     # Unified low-rank mode: 'none', 'static', 'dynamic', 'learnable'
     self.low_rank_mode = getattr(
         config.model, 'low_rank_mode', 'none')
@@ -401,7 +431,7 @@ class DIT(nn.Module, huggingface_hub.PyTorchModelHubMixin):
       elif low_rank_attn:
         self.low_rank_mode = 'static'
     # For dynamic/learnable modes, ensure timestep injection
-    if self.low_rank_mode in ('dynamic', 'learnable'):
+    if self.low_rank_mode in ('dynamic', 'learnable', 'frozen_schedule'):
       self.timestep_low_rank = True
 
     self._ts_r_min_ratio = getattr(
@@ -438,7 +468,11 @@ class DIT(nn.Module, huggingface_hub.PyTorchModelHubMixin):
                               dropout=config.model.dropout,
                               low_rank_attn=low_rank_attn,
                               low_rank_percentage=adjusted_low_rank_percentage,
-                              low_rank_mode=self.low_rank_mode))
+                              low_rank_mode=self.low_rank_mode,
+                              learnable_gate_mode=learnable_gate_mode,
+                              learnable_gate_threshold=learnable_gate_threshold,
+                              learnable_min_active_rank=learnable_min_active_rank,
+                              learnable_eval_slice=learnable_eval_slice))
     self.blocks = nn.ModuleList(blocks)
 
     self.output_layer = DDitFinalLayer(

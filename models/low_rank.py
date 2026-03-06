@@ -161,8 +161,14 @@ class LowRankLinear(nn.Module):
         parameter count to retain.
     bias: If ``True``, adds a learnable bias of shape
         ``(out_features,)``.
-    mode: Low-rank mode — ``'static'``, ``'dynamic'``, or
-        ``'learnable'``.
+    mode: One of ``'static'``, ``'dynamic'`` or ``'learnable'``.
+    learnable_gate_mode: Learnable-mode gate type, ``'soft'`` or
+        ``'hard_ste'``.
+    learnable_gate_threshold: Threshold τ used by ``'hard_ste'``.
+    learnable_min_active_rank: Minimum number of active ranks kept in
+        hard-gating mode.
+    learnable_eval_slice: Enable eval-only sliced fast path when
+        hard-gate active rank is uniform across batch.
   """
 
   def __init__(
@@ -172,12 +178,29 @@ class LowRankLinear(nn.Module):
       rank_percentage: float = 1.0,
       bias: bool = False,
       mode: str = 'static',
+      learnable_gate_mode: str = 'soft',
+      learnable_gate_threshold: float = 0.5,
+      learnable_min_active_rank: int = 1,
+      learnable_eval_slice: bool = True,
   ):
     super().__init__()
     self.in_features = in_features
     self.out_features = out_features
     self.rank_percentage = rank_percentage
     self.mode = mode  # 'static', 'dynamic', or 'learnable'
+    self.learnable_gate_mode = learnable_gate_mode
+    self.learnable_gate_threshold = float(learnable_gate_threshold)
+    self.learnable_min_active_rank = int(learnable_min_active_rank)
+    self.learnable_eval_slice = bool(learnable_eval_slice)
+
+    if self.learnable_gate_mode not in ('soft', 'hard_ste'):
+      raise ValueError(
+          "learnable_gate_mode must be 'soft' or 'hard_ste', "
+          f"got '{self.learnable_gate_mode}'.")
+    if self.learnable_min_active_rank < 0:
+      raise ValueError(
+          "learnable_min_active_rank must be >= 0, "
+          f"got {self.learnable_min_active_rank}.")
 
     # Compute rank from the target parameter-count percentage.
     dense_params = in_features * out_features
@@ -206,9 +229,9 @@ class LowRankLinear(nn.Module):
     self._logistic_m: float = 0.6
     self._reverse_schedule: bool = False  # if True, high noise → high rank
 
-    # ----- learnable rank schedule (only for mode='learnable') -----
+    # ----- learnable rank schedule (only for mode='learnable' or 'frozen_schedule') -----
     self.schedule: LearnableRankSchedule | None = None
-    if mode == 'learnable':
+    if mode in ('learnable', 'frozen_schedule'):
       self.schedule = LearnableRankSchedule(r_max=rank)
 
     self.reset_parameters()
@@ -360,6 +383,64 @@ class LowRankLinear(nn.Module):
     return expected_rank, expected_percentage
 
   # ------------------------------------------------------------------
+  def _expand_timestep_to_batch(
+      self,
+      t: torch.Tensor,
+      batch_size: int,
+  ) -> torch.Tensor:
+    """Expand/align timestep tensor to match the first dim of x."""
+    t = t.reshape(-1)
+    if t.shape[0] == batch_size:
+      return t
+
+    B_t = t.shape[0]
+    if batch_size % B_t == 0:
+      repeat = batch_size // B_t
+      return t.unsqueeze(1).expand(-1, repeat).contiguous().view(-1)
+
+    repeat = math.ceil(batch_size / B_t)
+    return t.unsqueeze(1).expand(-1, repeat).contiguous().view(-1)[:batch_size]
+
+  def _build_learnable_gate(
+      self,
+      t_expanded: torch.Tensor,
+  ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Build learnable gate and hard-mask stats for optional fast path."""
+    if self.schedule is None:
+      raise RuntimeError("Learnable schedule is not initialized.")
+
+    p = self.schedule.soft_mask(t_expanded)  # [B, rank]
+    hard_mask = p > self.learnable_gate_threshold
+
+    min_active = min(self.learnable_min_active_rank, self.rank)
+    if min_active > 0:
+      active = hard_mask.sum(dim=-1)
+      need_fill = active < min_active
+      if bool(torch.any(need_fill)):
+        hard_mask[need_fill, :min_active] = True
+
+    hard_mask_f = hard_mask.to(dtype=p.dtype)
+    gate_hard = p * hard_mask_f
+
+    if self.learnable_gate_mode == 'hard_ste':
+      gate = (gate_hard - p).detach() + p
+    else:
+      gate = p
+
+    hard_counts = hard_mask.sum(dim=-1).to(torch.long)
+    return gate, hard_mask, hard_counts
+
+  def _is_prefix_hard_mask(
+      self,
+      hard_mask: torch.Tensor,
+      hard_counts: torch.Tensor,
+  ) -> bool:
+    """Check if each hard mask row is a prefix [1...1,0...0]."""
+    idx = torch.arange(self.rank, device=hard_mask.device)
+    expected = idx.unsqueeze(0) < hard_counts.unsqueeze(1)
+    return bool(torch.all(hard_mask == expected))
+
+  # ------------------------------------------------------------------
   def forward(self, x: torch.Tensor) -> torch.Tensor:
     # ---- static path (no timestep conditioning) --------------------
     if self._timestep is None:
@@ -376,29 +457,31 @@ class LowRankLinear(nn.Module):
   def _forward_learnable(self, x: torch.Tensor) -> torch.Tensor:
     """Forward with learnable schedule and differentiable soft mask."""
     t = self._timestep  # [B]  t ∈ [0, 1]
-
     B_x = x.shape[0]
-    B_t = t.shape[0]
+    t_expanded = self._expand_timestep_to_batch(t, B_x)
+    gate, hard_mask, hard_counts = self._build_learnable_gate(t_expanded)
 
-    # Expand t if batch dims differ
-    if B_x == B_t:
-      t_expanded = t
-    elif B_x % B_t == 0:
-      repeat = B_x // B_t
-      t_expanded = t.unsqueeze(1).expand(-1, repeat).contiguous().view(-1)
-    else:
-      repeat = math.ceil(B_x / B_t)
-      t_expanded = t.unsqueeze(1).expand(-1, repeat).contiguous().view(-1)[:B_x]
+    # Eval fast path: hard-STE with shared active rank and prefix masks.
+    if (
+        self.learnable_gate_mode == 'hard_ste'
+        and self.learnable_eval_slice
+        and (not self.training)
+        and hard_counts.numel() > 0
+        and bool(torch.all(hard_counts == hard_counts[0]))
+    ):
+      r_active = int(hard_counts[0].item())
+      if r_active > 0 and self._is_prefix_hard_mask(hard_mask, hard_counts):
+        Bx = F.linear(x, self.B[:r_active, :])  # (..., r_active)
+        gate_slice = gate[..., :r_active]
+        if Bx.dim() == 3:
+          gate_slice = gate_slice.unsqueeze(1)
+        Bx = Bx * gate_slice
+        return F.linear(Bx, self.A[:, :r_active], self.bias)
 
-    mask = self.schedule.soft_mask(t_expanded)  # [B_x, rank]
-
-    Bx = F.linear(x, self.B)                   # (..., rank)
-
-    # Handle 3-D tensors (batch, seq, rank)
+    Bx = F.linear(x, self.B)  # (..., rank)
     if Bx.dim() == 3:
-      mask = mask.unsqueeze(1)                  # [B_x, 1, rank]
-
-    Bx = Bx * mask
+      gate = gate.unsqueeze(1)
+    Bx = Bx * gate
     return F.linear(Bx, self.A, self.bias)
 
   def _forward_dynamic(self, x: torch.Tensor) -> torch.Tensor:
@@ -446,5 +529,9 @@ class LowRankLinear(nn.Module):
         f'rank={self.rank}, '
         f'rank_percentage={self.rank_percentage}, '
         f'mode={self.mode}, '
+        f'learnable_gate_mode={self.learnable_gate_mode}, '
+        f'learnable_gate_threshold={self.learnable_gate_threshold}, '
+        f'learnable_min_active_rank={self.learnable_min_active_rank}, '
+        f'learnable_eval_slice={self.learnable_eval_slice}, '
         f'bias={self.bias is not None}'
     )
