@@ -194,47 +194,6 @@ class Diffusion(L.LightningModule):
     self.target_activation_ratio = getattr(
         self.config.training, 'target_activation_ratio', 0.5)
 
-    # --- Frozen schedule: load rank-schedule params & freeze ---
-    _lr_mode = getattr(self.config.model, 'low_rank_mode', 'none')
-    if _lr_mode == 'frozen_schedule':
-      frozen_ckpt_path = getattr(
-          self.config.training, 'frozen_schedule_ckpt', None)
-      assert frozen_ckpt_path is not None, \
-          ("frozen_schedule mode requires "
-           "training.frozen_schedule_ckpt to be set")
-      ckpt = torch.load(frozen_ckpt_path, map_location='cpu')
-      # Lightning checkpoints store state_dict under 'state_dict'
-      src_state = ckpt.get('state_dict', ckpt)
-      schedule_state = build_verified_schedule_state(
-          source_state=src_state,
-          target_state=self.backbone.state_dict(),
-          ckpt_path=frozen_ckpt_path,
-      )
-      self.backbone.load_state_dict(schedule_state, strict=False)
-      print(f"[frozen_schedule] Loaded {len(schedule_state)} "
-            f"schedule params from {frozen_ckpt_path}")
-      # Freeze all LearnableRankSchedule parameters
-      for module in self.backbone.modules():
-        if isinstance(module, LearnableRankSchedule):
-          for param in module.parameters():
-            param.requires_grad_(False)
-      # Log loaded schedule values
-      for i, module in enumerate(
-          m for m in self.backbone.modules()
-          if isinstance(m, LowRankLinear)
-          and m.schedule is not None):
-        print(
-            f"[frozen_schedule] Layer {i}: "
-            f"alpha={module.schedule.alpha.item():.4f}, "
-            f"rho_min={module.schedule.rho_min.item():.4f}, "
-            f"expected_rank="
-            f"{module.schedule.expected_rank().item():.2f}/"
-            f"{module.rank}")
-      # Disable FLOPs loss since schedule is fixed
-      self.flops_lambda = 0.0
-      print("[frozen_schedule] FLOPs loss disabled "
-            "(schedule is frozen)")
-
     self._validate_configuration()
 
   def _validate_configuration(self):
@@ -741,7 +700,7 @@ class Diffusion(L.LightningModule):
     move_chance_s = (t - dt)[:, None, None]
     assert move_chance_t.ndim == 3, move_chance_t.shape
     if p_x0 is None:
-      p_x0 = self.forward(x, sigma_t).exp()
+      p_x0 = self.forward(x, sigma_t, t_for_rank=t).exp()
     
     assert move_chance_t.ndim == p_x0.ndim
     q_xs = p_x0 * (move_chance_t - move_chance_s)
@@ -765,7 +724,9 @@ class Diffusion(L.LightningModule):
     move_chance_t = move_chance_t[:, None, None]
     move_chance_s = move_chance_s[:, None, None]
     unet_conditioning = sigma_t
-    log_p_x0 = self.forward(x, unet_conditioning)
+    t_for_rank = t.squeeze(-1) if t.ndim > 1 else t
+    log_p_x0 = self.forward(x, unet_conditioning,
+                            t_for_rank=t_for_rank)
     assert move_chance_t.ndim == log_p_x0.ndim
     # Technically, this isn't q_xs since there's a division
     # term that is missing. This division term doesn't affect
@@ -836,7 +797,9 @@ class Diffusion(L.LightningModule):
         x = self._denoiser_update(x, t)
       else:
         unet_conditioning = self.noise(t)[0]
-        x = self.forward(x, unet_conditioning).argmax(dim=-1)
+        x = self.forward(
+          x, unet_conditioning,
+          t_for_rank=t.squeeze(-1) if t.ndim > 1 else t).argmax(dim=-1)
     return x
 
   def restore_model_and_sample(self, num_steps, eps=1e-5):
@@ -860,8 +823,8 @@ class Diffusion(L.LightningModule):
     self.noise.train()
     return samples
 
-  def get_score(self, x, sigma):
-    model_output = self.forward(x, sigma)
+  def get_score(self, x, sigma, t_for_rank=None):
+    model_output = self.forward(x, sigma, t_for_rank=t_for_rank)
     if self.parameterization == 'subs':
       # score(x, t) = p_t(y) / p_t(x)
       # => log score(x, t) = log p_t(y) - log p_t(x)
@@ -916,14 +879,16 @@ class Diffusion(L.LightningModule):
     curr_sigma, _ = self.noise(t)
     next_sigma, _ = self.noise(t - step_size)
     dsigma = curr_sigma - next_sigma
-    score = self.get_score(x, curr_sigma)
+    t_for_rank = t.squeeze(-1) if t.ndim > 1 else t
+    score = self.get_score(x, curr_sigma, t_for_rank=t_for_rank)
     stag_score = self._staggered_score(score, dsigma)
     probs = stag_score * self._transp_transition(x, dsigma)
     return _sample_categorical(probs)
 
   def _denoiser_update(self, x, t):
     sigma, _ = self.noise(t)
-    score = self.get_score(x, sigma)
+    t_for_rank = t.squeeze(-1) if t.ndim > 1 else t
+    score = self.get_score(x, sigma, t_for_rank=t_for_rank)
     stag_score = self._staggered_score(score, sigma)
     probs = stag_score * self._transp_transition(x, sigma)
     probs[..., self.mask_index] = 0
@@ -981,7 +946,8 @@ class Diffusion(L.LightningModule):
     assert self.config.noise.type == 'loglinear'
     # The above assert is for d3pm parameterization
     unet_conditioning = self.noise(t0)[0][:, None]
-    model_output_t0 = self.forward(x0, unet_conditioning)
+    model_output_t0 = self.forward(x0, unet_conditioning,
+                                   t_for_rank=t0)
     return - torch.gather(input=model_output_t0,
                           dim=-1,
                           index=x0[:, :, None]).squeeze(-1)
@@ -1122,7 +1088,7 @@ class Diffusion(L.LightningModule):
           p_x0_cache = None
           sampling_steps += 1
         x = x_next
-      x = self.forward(x, 0 * ones).argmax(dim=-1)
+      x = self.forward(x, 0 * ones, t_for_rank=0 * ones).argmax(dim=-1)
       intermediate_tokens.append(
         x[:, :stride_length].cpu().numpy())
       target = x[:, stride_length:]
